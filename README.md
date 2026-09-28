@@ -24,7 +24,7 @@ Dự án **Khu Vườn Vui Vẻ** được phát triển nhằm tối ưu hóa v
 - **Cảm biến:**
   - Cảm biến nhiệt độ & độ ẩm không khí: **DHT22** (GPIO 19)
   - Cảm biến độ ẩm đất: **Capacitive Soil Moisture Sensor** (GPIO 34 & GPIO 34)
-- **Thiết bị chấp hành:**
+- **Thiết bị khác:**
   - Mạch Rơ-le (Relay) kích tưới/phun sương (GPIO 4)
   - Quạt tản nhiệt/làm mát PWM (GPIO 32)
 
