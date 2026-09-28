@@ -1,0 +1,848 @@
+import network
+import time
+import machine
+import dht
+import json
+import gc
+import socket
+
+# ============================================================================
+# 0. WI-FI CONNECTION & SERVER IP PRINTING
+# ============================================================================
+SSID = "@"
+PASSWORD = ""
+
+wlan = network.WLAN(network.STA_IF)
+wlan.active(True)
+
+if not wlan.isconnected():
+    print("Đang kết nối Wi-Fi...")
+    wlan.connect(SSID, PASSWORD)
+    
+    timeout = 10
+    while not wlan.isconnected() and timeout > 0:
+        time.sleep(1)
+        timeout -= 1
+
+if wlan.isconnected():
+    ip_address = wlan.ifconfig()[0]
+    print("\n==============================================")
+    print(" KẾT NỐI WI-FI THÀNH CÔNG!")
+    print(f" Địa chỉ Server truy cập Web: http://{ip_address}")
+    print("==============================================\n")
+else:
+    print("\n[CẢNH BÁO] Kết nối Wi-Fi thất bại. Vui lòng kiểm tra SSID/Mật khẩu.\n")
+
+# ============================================================================
+# 1. GPIO CONFIGURATION (CẤU HÌNH CHÂN PHẦN CỨNG)
+# ============================================================================
+PUMP1_PIN = 4       # Relay Bơm Zone 1
+PUMP2_PIN = 25      # Relay Bơm Zone 2
+DHT_PIN = 19        # Cảm biến DHT22
+SOIL1_PIN = 34      # Cảm biến độ ẩm đất Zone 1 (ADC1_CH6)
+SOIL2_PIN = 35      # Cảm biến độ ẩm đất Zone 2 (ADC1_CH7)
+FAN_PIN = 32        # Quạt tản nhiệt/thông gió (PWM)
+
+# ============================================================================
+# 2. CALIBRATION & SAFETY CONFIG
+# ============================================================================
+SOIL1_DRY_ADC = 3200
+SOIL1_WET_ADC = 1300
+
+SOIL2_DRY_ADC = 3200
+SOIL2_WET_ADC = 1300
+
+ADC_MIN_VALID = 200
+ADC_MAX_VALID = 3900
+
+ALLOW_DUAL_PUMP = False         # Không cho phép 2 bơm chạy cùng lúc
+MANUAL_PUMP_MAX_ON_MS = 10000   # Thời gian chạy tối đa bơm thủ công (10s)
+DHT_READ_INTERVAL_MS = 3000     # Chu kỳ đọc DHT22 (3s)
+
+# ============================================================================
+# 3. REBOOT SAFETY INITIALIZATION
+# ============================================================================
+pump1_gpio = machine.Pin(PUMP1_PIN, machine.Pin.OUT)
+pump2_gpio = machine.Pin(PUMP2_PIN, machine.Pin.OUT)
+pump1_gpio.value(0)
+pump2_gpio.value(0)
+
+fan_pwm = machine.PWM(machine.Pin(FAN_PIN), freq=1000, duty=0)
+
+soil1_adc = machine.ADC(machine.Pin(SOIL1_PIN))
+soil1_adc.atten(machine.ADC.ATTN_11DB)
+
+soil2_adc = machine.ADC(machine.Pin(SOIL2_PIN))
+soil2_adc.atten(machine.ADC.ATTN_11DB)
+
+dht_sensor = dht.DHT22(machine.Pin(DHT_PIN))
+
+print("[INFO] Hardware GPIO initialized. Pumps forced OFF.")
+
+# ============================================================================
+# 4. DATABASE 50 LOẠI CÂY TRỒNG & PROFILE MẶC ĐỊNH
+# ============================================================================
+DEFAULT_PROFILE = {
+    "name": "Mặc định",
+    "soil_start": 55,
+    "soil_stop": 70,
+    "pulse_ms": 4000,
+    "soak_ms": 15000,
+    "max_pulses": 3,
+    "cooldown_ms": 30000,
+    "fan_temp_start": 28.0,
+    "fan_temp_stop": 25.0,
+    "fan_rh_high": 80.0
+}
+
+PLANTS_DATABASE = {
+    "Xa lach": {"soil_start": 60, "soil_stop": 75, "fan_temp_start": 24.0, "fan_temp_stop": 21.0, "fan_rh_high": 75.0},
+    "Cai ngọt": {"soil_start": 65, "soil_stop": 80, "fan_temp_start": 28.0, "fan_temp_stop": 24.0, "fan_rh_high": 80.0},
+    "Cai thia": {"soil_start": 65, "soil_stop": 80, "fan_temp_start": 28.0, "fan_temp_stop": 24.0, "fan_rh_high": 80.0},
+    "Cai kale": {"soil_start": 60, "soil_stop": 75, "fan_temp_start": 22.0, "fan_temp_stop": 18.0, "fan_rh_high": 75.0},
+    "Rau bo xoi": {"soil_start": 60, "soil_stop": 70, "fan_temp_start": 20.0, "fan_temp_stop": 17.0, "fan_rh_high": 70.0},
+    "Rau muong": {"soil_start": 75, "soil_stop": 90, "fan_temp_start": 33.0, "fan_temp_stop": 28.0, "fan_rh_high": 85.0},
+    "Rau den": {"soil_start": 65, "soil_stop": 80, "fan_temp_start": 31.0, "fan_temp_stop": 26.0, "fan_rh_high": 80.0},
+    "Rau ngot": {"soil_start": 65, "soil_stop": 75, "fan_temp_start": 30.0, "fan_temp_stop": 25.0, "fan_rh_high": 80.0},
+    "Rau mong tai": {"soil_start": 70, "soil_stop": 85, "fan_temp_start": 32.0, "fan_temp_stop": 27.0, "fan_rh_high": 85.0},
+    "Tan o": {"soil_start": 60, "soil_stop": 75, "fan_temp_start": 25.0, "fan_temp_stop": 20.0, "fan_rh_high": 75.0},
+    "Cai cuc": {"soil_start": 60, "soil_stop": 75, "fan_temp_start": 24.0, "fan_temp_stop": 20.0, "fan_rh_high": 70.0},
+    "Hanh la": {"soil_start": 60, "soil_stop": 70, "fan_temp_start": 26.0, "fan_temp_stop": 21.0, "fan_rh_high": 75.0},
+    "Ca chua bi": {"soil_start": 65, "soil_stop": 75, "fan_temp_start": 28.0, "fan_temp_stop": 23.0, "fan_rh_high": 70.0},
+    "Ot chuong": {"soil_start": 60, "soil_stop": 75, "fan_temp_start": 28.0, "fan_temp_stop": 23.0, "fan_rh_high": 70.0},
+    "Dua luoi": {"soil_start": 55, "soil_stop": 70, "fan_temp_start": 32.0, "fan_temp_stop": 27.0, "fan_rh_high": 68.0},
+    "Dua leo": {"soil_start": 70, "soil_stop": 80, "fan_temp_start": 30.0, "fan_temp_stop": 25.0, "fan_rh_high": 75.0},
+    "Dua hau": {"soil_start": 55, "soil_stop": 68, "fan_temp_start": 32.0, "fan_temp_stop": 27.0, "fan_rh_high": 65.0},
+    "Ca tim": {"soil_start": 65, "soil_stop": 75, "fan_temp_start": 30.0, "fan_temp_stop": 25.0, "fan_rh_high": 70.0},
+    "Bau bi": {"soil_start": 65, "soil_stop": 80, "fan_temp_start": 31.0, "fan_temp_stop": 26.0, "fan_rh_high": 80.0},
+    "Kho qua": {"soil_start": 65, "soil_stop": 75, "fan_temp_start": 30.0, "fan_temp_stop": 25.0, "fan_rh_high": 75.0},
+    "Muop huong": {"soil_start": 70, "soil_stop": 80, "fan_temp_start": 31.0, "fan_temp_stop": 26.0, "fan_rh_high": 80.0},
+    "Dau co ve": {"soil_start": 60, "soil_stop": 70, "fan_temp_start": 28.0, "fan_temp_stop": 23.0, "fan_rh_high": 70.0},
+    "Dau Ha Lan": {"soil_start": 60, "soil_stop": 70, "fan_temp_start": 22.0, "fan_temp_stop": 18.0, "fan_rh_high": 70.0},
+    "Cu cai do": {"soil_start": 60, "soil_stop": 70, "fan_temp_start": 24.0, "fan_temp_stop": 20.0, "fan_rh_high": 70.0},
+    "Cu den": {"soil_start": 60, "soil_stop": 70, "fan_temp_start": 25.0, "fan_temp_stop": 20.0, "fan_rh_high": 70.0},
+    "Dau tay Da Lat": {"soil_start": 60, "soil_stop": 70, "fan_temp_start": 22.0, "fan_temp_stop": 18.0, "fan_rh_high": 70.0},
+    "Dau tay chịu nhiệt": {"soil_start": 60, "soil_stop": 70, "fan_temp_start": 28.0, "fan_temp_stop": 23.0, "fan_rh_high": 70.0},
+    "Nho ha den": {"soil_start": 50, "soil_stop": 65, "fan_temp_start": 30.0, "fan_temp_stop": 25.0, "fan_rh_high": 65.0},
+    "Nam linh chi": {"soil_start": 70, "soil_stop": 85, "fan_temp_start": 27.0, "fan_temp_stop": 24.0, "fan_rh_high": 88.0},
+    "Nam bao ngu": {"soil_start": 75, "soil_stop": 85, "fan_temp_start": 27.0, "fan_temp_stop": 24.0, "fan_rh_high": 88.0},
+    "Dong trung ha thao": {"soil_start": 65, "soil_stop": 75, "fan_temp_start": 21.0, "fan_temp_stop": 18.0, "fan_rh_high": 82.0},
+    "Dinh lang": {"soil_start": 60, "soil_stop": 70, "fan_temp_start": 29.0, "fan_temp_stop": 25.0, "fan_rh_high": 75.0},
+    "Hung tay": {"soil_start": 55, "soil_stop": 70, "fan_temp_start": 27.0, "fan_temp_stop": 23.0, "fan_rh_high": 65.0},
+    "Bac ha": {"soil_start": 65, "soil_stop": 75, "fan_temp_start": 25.0, "fan_temp_stop": 21.0, "fan_rh_high": 75.0},
+    "Huong thao": {"soil_start": 40, "soil_stop": 55, "fan_temp_start": 25.0, "fan_temp_stop": 20.0, "fan_rh_high": 60.0},
+    "Can tay": {"soil_start": 70, "soil_stop": 80, "fan_temp_start": 22.0, "fan_temp_stop": 18.0, "fan_rh_high": 75.0},
+    "Thi la": {"soil_start": 55, "soil_stop": 68, "fan_temp_start": 24.0, "fan_temp_stop": 20.0, "fan_rh_high": 70.0},
+    "Ngo ri": {"soil_start": 60, "soil_stop": 70, "fan_temp_start": 22.0, "fan_temp_stop": 18.0, "fan_rh_high": 70.0},
+    "Tia to": {"soil_start": 60, "soil_stop": 70, "fan_temp_start": 29.0, "fan_temp_stop": 24.0, "fan_rh_high": 70.0},
+    "Co ngọt": {"soil_start": 60, "soil_stop": 70, "fan_temp_start": 27.0, "fan_temp_stop": 23.0, "fan_rh_high": 70.0},
+    "Lan Ho Diep": {"soil_start": 50, "soil_stop": 65, "fan_temp_start": 26.0, "fan_temp_stop": 22.0, "fan_rh_high": 75.0},
+    "Lan Vu Nu": {"soil_start": 50, "soil_stop": 60, "fan_temp_start": 28.0, "fan_temp_stop": 23.0, "fan_rh_high": 70.0},
+    "Hoa Hong": {"soil_start": 60, "soil_stop": 70, "fan_temp_start": 25.0, "fan_temp_stop": 20.0, "fan_rh_high": 70.0},
+    "Hoa Cuc": {"soil_start": 60, "soil_stop": 70, "fan_temp_start": 24.0, "fan_temp_stop": 20.0, "fan_rh_high": 70.0},
+    "Hoa Dong Tien": {"soil_start": 60, "soil_stop": 70, "fan_temp_start": 24.0, "fan_temp_stop": 19.0, "fan_rh_high": 70.0},
+    "Hoa Cat Tuong": {"soil_start": 55, "soil_stop": 65, "fan_temp_start": 23.0, "fan_temp_stop": 19.0, "fan_rh_high": 70.0},
+    "Hoa Cam Chuong": {"soil_start": 55, "soil_stop": 65, "fan_temp_start": 22.0, "fan_temp_stop": 18.0, "fan_rh_high": 65.0},
+    "Hoa Ly": {"soil_start": 60, "soil_stop": 70, "fan_temp_start": 22.0, "fan_temp_stop": 18.0, "fan_rh_high": 70.0},
+    "Monstera": {"soil_start": 65, "soil_stop": 75, "fan_temp_start": 29.0, "fan_temp_stop": 24.0, "fan_rh_high": 82.0},
+    "Sen da": {"soil_start": 30, "soil_stop": 45, "fan_temp_start": 30.0, "fan_temp_stop": 24.0, "fan_rh_high": 55.0}
+}
+
+def get_plant_profile(plant_name):
+    if plant_name in PLANTS_DATABASE:
+        p = PLANTS_DATABASE[plant_name]
+        prof = DEFAULT_PROFILE.copy()
+        prof["name"] = plant_name
+        prof.update(p)
+        return prof
+    return DEFAULT_PROFILE.copy()
+
+# ============================================================================
+# 5. IRRIGATION ZONE CLASS
+# ============================================================================
+class IrrigationZone:
+    def __init__(self, zone_id, adc_pin, pump_pin, dry_adc, wet_adc):
+        self.zone_id = zone_id
+        self.adc = adc_pin
+        self.pump_pin = pump_pin
+        self.dry_adc = dry_adc
+        self.wet_adc = wet_adc
+        
+        self.state = "IDLE"
+        self.soil_pct = None
+        self.soil_valid = False
+        self.raw_adc = 0
+        
+        self.pulse_count = 0
+        self.state_timer = time.ticks_ms()
+        self.manual_start_time = 0
+        
+    def set_pump(self, state_bool):
+        self.pump_pin.value(1 if state_bool else 0)
+
+    def is_pump_on(self):
+        return self.pump_pin.value() == 1
+
+    def read_sensor(self):
+        total = 0
+        samples = 5
+        for _ in range(samples):
+            total += self.adc.read()
+            time.sleep_ms(2)
+        raw = total // samples
+        self.raw_adc = raw
+
+        if raw < ADC_MIN_VALID or raw > ADC_MAX_VALID:
+            self.soil_valid = False
+            self.soil_pct = None
+            return False
+        
+        pct = int((self.dry_adc - raw) * 100 / (self.dry_adc - self.wet_adc))
+        if pct < 0: pct = 0
+        if pct > 100: pct = 100
+        
+        self.soil_pct = pct
+        self.soil_valid = True
+        return True
+
+    def update_auto(self, profile, other_zone_pump_active):
+        now = time.ticks_ms()
+        
+        if not self.read_sensor():
+            if self.state != "ERROR":
+                print(f"[ERROR] Zone {self.zone_id} Sensor Invalid! ADC: {self.raw_adc}")
+            self.state = "ERROR"
+            self.set_pump(False)
+            return
+
+        if self.state == "ERROR" and self.soil_valid:
+            self.state = "IDLE"
+
+        if self.state == "IDLE":
+            self.set_pump(False)
+            if self.soil_pct < profile["soil_start"]:
+                print(f"[ZONE {self.zone_id}] Dry detected ({self.soil_pct}% < {profile['soil_start']}%). Requesting WATERING.")
+                self.pulse_count = 0
+                self.state = "WAITING_PUMP"
+
+        elif self.state == "WAITING_PUMP":
+            if not ALLOW_DUAL_PUMP and other_zone_pump_active:
+                return
+            
+            self.pulse_count += 1
+            print(f"[ZONE {self.zone_id}] Pulse {self.pulse_count}/{profile['max_pulses']} Starting...")
+            self.set_pump(True)
+            self.state_timer = now
+            self.state = "WATERING"
+
+        elif self.state == "WATERING":
+            if time.ticks_diff(now, self.state_timer) >= profile["pulse_ms"]:
+                self.set_pump(False)
+                print(f"[ZONE {self.zone_id}] Pulse finished. SOAKING...")
+                self.state_timer = now
+                self.state = "SOAKING"
+
+        elif self.state == "SOAKING":
+            self.set_pump(False)
+            if time.ticks_diff(now, self.state_timer) >= profile["soak_ms"]:
+                print(f"[ZONE {self.zone_id}] Soaking done. RECHECKING...")
+                self.state = "RECHECK"
+
+        elif self.state == "RECHECK":
+            self.read_sensor()
+            if self.soil_valid and self.soil_pct >= profile["soil_stop"]:
+                print(f"[ZONE {self.zone_id}] Moisture satisfied. Going to COMPLETE.")
+                self.state_timer = now
+                self.state = "COMPLETE"
+            elif self.pulse_count >= profile["max_pulses"]:
+                print(f"[ZONE {self.zone_id}] Max pulses reached. Going to COMPLETE.")
+                self.state_timer = now
+                self.state = "COMPLETE"
+            else:
+                self.state = "WAITING_PUMP"
+
+        elif self.state == "COMPLETE":
+            self.set_pump(False)
+            self.state = "COOLDOWN"
+            self.state_timer = now
+
+        elif self.state == "COOLDOWN":
+            self.set_pump(False)
+            if time.ticks_diff(now, self.state_timer) >= profile["cooldown_ms"]:
+                print(f"[ZONE {self.zone_id}] Cooldown finished. Back to IDLE.")
+                self.state = "IDLE"
+
+zone1 = IrrigationZone(1, soil1_adc, pump1_gpio, SOIL1_DRY_ADC, SOIL1_WET_ADC)
+zone2 = IrrigationZone(2, soil2_adc, pump2_gpio, SOIL2_DRY_ADC, SOIL2_WET_ADC)
+
+# ============================================================================
+# 6. SYSTEM STATE & DUAL ZONE PROFILE MANAGEMENT
+# ============================================================================
+system_mode = "AUTO"
+
+# Cấu hình 2 cây trồng riêng biệt cho Zone 1 và Zone 2
+selected_plant_zone1 = "default"
+profile_zone1 = DEFAULT_PROFILE.copy()
+
+selected_plant_zone2 = "default"
+profile_zone2 = DEFAULT_PROFILE.copy()
+
+dht_temperature = None
+dht_humidity = None
+dht_valid = False
+last_dht_read_time = 0
+
+fan_speed_pct = 0
+manual_fan_speed_pct = 0
+
+def update_dht_sensor():
+    global dht_temperature, dht_humidity, dht_valid, last_dht_read_time
+    now = time.ticks_ms()
+    if time.ticks_diff(now, last_dht_read_time) >= DHT_READ_INTERVAL_MS:
+        last_dht_read_time = now
+        try:
+            dht_sensor.measure()
+            dht_temperature = round(dht_sensor.temperature(), 1)
+            dht_humidity = round(dht_sensor.humidity(), 1)
+            dht_valid = True
+        except Exception:
+            dht_valid = False
+            dht_temperature = None
+            dht_humidity = None
+
+def set_fan_duty(percent):
+    global fan_speed_pct
+    pct = max(0, min(100, percent))
+    fan_speed_pct = pct
+    duty_val = int(pct * 1023 / 100)
+    fan_pwm.duty(duty_val)
+
+def update_air_control():
+    """Điều khiển quạt Tuyến tính (Proportional) - Sửa triệt để lỗi kẹt 70%-100%"""
+    global fan_speed_pct
+    if system_mode == "MANUAL":
+        set_fan_duty(manual_fan_speed_pct)
+        return
+
+    if not dht_valid or dht_temperature is None:
+        set_fan_duty(0)
+        return
+
+    # Lấy ngưỡng an toàn nhất cho cả 2 vùng cây trồng
+    t_start = min(profile_zone1["fan_temp_start"], profile_zone2["fan_temp_start"])
+    t_stop = min(profile_zone1["fan_temp_stop"], profile_zone2["fan_temp_stop"])
+    rh_high = min(profile_zone1["fan_rh_high"], profile_zone2["fan_rh_high"])
+
+    # Tính toán tốc độ tuyến tính chính xác theo nhiệt độ thực tế
+    if dht_temperature >= t_start:
+        target_speed = 100
+    elif dht_temperature <= t_stop:
+        target_speed = 0
+    else:
+        # Tăng dần tốc độ quạt theo khoảng chênh lệch nhiệt độ
+        target_speed = int((dht_temperature - t_stop) / (t_start - t_stop) * 100)
+
+    # Ưu tiên thông gió nếu độ ẩm không khí vượt ngưỡng an toàn
+    if dht_humidity is not None and dht_humidity >= rh_high:
+        target_speed = max(target_speed, 70)
+
+    set_fan_duty(target_speed)
+
+def enforce_pump_safety():
+    now = time.ticks_ms()
+    if system_mode == "MANUAL":
+        if zone1.is_pump_on() and time.ticks_diff(now, zone1.manual_start_time) > MANUAL_PUMP_MAX_ON_MS:
+            print("[SAFETY] Zone 1 Manual timeout! Forcing OFF.")
+            zone1.set_pump(False)
+            
+        if zone2.is_pump_on() and time.ticks_diff(now, zone2.manual_start_time) > MANUAL_PUMP_MAX_ON_MS:
+            print("[SAFETY] Zone 2 Manual timeout! Forcing OFF.")
+            zone2.set_pump(False)
+
+    if not ALLOW_DUAL_PUMP:
+        if zone1.is_pump_on() and zone2.is_pump_on():
+            print("[SAFETY DUAL PUMP] Both pumps active! Force stopping Pump 2.")
+            zone2.set_pump(False)
+
+# ============================================================================
+# 7. WEB FRONTEND (GIAO DIỆN CHỌN CÂY CHO 2 ZONE RIÊNG BIỆT)
+# ============================================================================
+HTML_WEB_PAGE = """<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hệ Thống Nhà Kính ESP32 Dual-Zone</title>
+    <style>
+        :root {
+            --bg-gradient-start: #e8f5e9;
+            --bg-gradient-end: #c8e6c9;
+            --primary: #2e7d32;
+            --primary-light: #4caf50;
+            --panel-bg: #ffffff;
+            --text-main: #1b5e20;
+            --text-sub: #4e7d52;
+            --card-shadow: 0 4px 12px rgba(46, 125, 50, 0.08);
+            --border-color: #a5d6a7;
+            --error-color: #c62828;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+        body {
+            background: linear-gradient(135deg, var(--bg-gradient-start), var(--bg-gradient-end));
+            color: var(--text-main);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+        header {
+            background: rgba(255, 255, 255, 0.95);
+            backdrop-filter: blur(8px);
+            padding: 12px 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid var(--border-color);
+            position: sticky; top: 0; z-index: 100;
+        }
+        .logo-title { font-size: 1.1rem; font-weight: 700; color: var(--primary); }
+        .conn-status { font-size: 0.85rem; padding: 4px 10px; border-radius: 12px; font-weight: 600; display: flex; align-items: center; gap: 6px; }
+        .conn-online { background: #e8f5e9; color: #2e7d32; border: 1px solid #a5d6a7; }
+        .conn-offline { background: #ffebee; color: #c62828; border: 1px solid #ef9a9a; }
+        .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+        .dot-online { background: #4caf50; }
+        .dot-offline { background: #e53935; }
+
+        .app-container {
+            display: flex; flex: 1; max-width: 1200px; margin: 0 auto; width: 100%; padding: 15px; gap: 15px;
+        }
+        .drawer {
+            position: fixed; top: 60px; bottom: 0; width: 320px; background: var(--panel-bg);
+            box-shadow: var(--card-shadow); border-radius: 16px 16px 0 0; padding: 20px;
+            transition: transform 0.3s ease; z-index: 90; overflow-y: auto;
+        }
+        #left-drawer { left: 0; border-right: 1px solid var(--border-color); transform: translateX(-100%); }
+        #left-drawer.open { transform: translateX(0); }
+        #right-drawer { right: 0; border-left: 1px solid var(--border-color); transform: translateX(100%); }
+        #right-drawer.open { transform: translateX(0); }
+
+        @media (min-width: 900px) {
+            .drawer { position: relative; top: 0; transform: none !important; border-radius: 16px; height: fit-content; }
+            .toggle-btn { display: none !important; }
+        }
+        .toggle-btn {
+            background: var(--panel-bg); border: 1px solid var(--border-color); color: var(--primary);
+            padding: 8px 12px; border-radius: 8px; font-weight: 600; cursor: pointer; font-size: 0.85rem;
+        }
+        .center-content { flex: 1; display: flex; flex-direction: column; gap: 15px; }
+        .card {
+            background: var(--panel-bg); border-radius: 16px; padding: 18px;
+            box-shadow: var(--card-shadow); border: 1px solid rgba(165, 214, 167, 0.4);
+        }
+        .card-title { font-size: 0.95rem; font-weight: 700; color: var(--text-sub); margin-bottom: 12px; text-transform: uppercase; }
+
+        .dual-plant-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+        .plant-card-zone {
+            background: #f1f8e9; border: 1px solid var(--border-color); border-radius: 12px; padding: 12px; text-align: center;
+        }
+        .plant-card-zone.active-zone { border: 2px solid var(--primary); background: #e8f5e9; }
+        .plant-title { font-weight: 700; font-size: 1rem; color: var(--primary); }
+        .target-sub { font-size: 0.8rem; color: var(--text-sub); margin-top: 4px; }
+
+        .soil-zones-container { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+        .soil-box { border-radius: 14px; padding: 15px; text-align: center; border: 1px solid var(--border-color); }
+        .soil-val { font-size: 1.8rem; font-weight: 800; margin: 8px 0; }
+        .soil-state { font-size: 0.75rem; font-weight: 700; text-transform: uppercase; padding: 3px 8px; border-radius: 8px; background: rgba(255,255,255,0.8); display: inline-block; }
+
+        .env-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 10px; }
+        .env-card { background: #fafafa; border: 1px solid #e0e0e0; border-radius: 12px; padding: 10px; text-align: center; }
+        .env-val { font-size: 1.1rem; font-weight: 700; color: #2e7d32; margin-top: 4px; }
+
+        .btn { width: 100%; padding: 10px; border: none; border-radius: 8px; font-weight: 600; cursor: pointer; margin-top: 8px; }
+        .btn-primary { background: var(--primary); color: white; }
+        .btn-outline { background: transparent; border: 1px solid var(--primary); color: var(--primary); }
+        .btn-danger { background: var(--error-color); color: white; }
+
+        .zone-tab-container { display: flex; gap: 8px; margin-bottom: 12px; }
+        .zone-tab { flex: 1; padding: 8px; text-align: center; background: #e8f5e9; border: 1px solid var(--border-color); border-radius: 8px; cursor: pointer; font-weight: 600; font-size: 0.85rem; }
+        .zone-tab.active { background: var(--primary); color: white; border-color: var(--primary); }
+
+        .search-box { width: 100%; padding: 8px 12px; border: 1px solid var(--border-color); border-radius: 8px; margin-bottom: 10px; outline: none; }
+        .plant-list-item { padding: 10px; border-bottom: 1px solid #edf7ed; cursor: pointer; border-radius: 6px; }
+        .plant-list-item:hover { background: #e8f5e9; }
+    </style>
+</head>
+<body>
+
+    <header>
+        <div class="logo-title">🌿 Vườn Trồng ESP32 (Dual Zone)</div>
+        <button class="toggle-btn" onclick="toggleDrawer('left-drawer')">Chế độ</button>
+        <div id="conn-badge" class="conn-status conn-offline">
+            <span class="dot dot-offline"></span> <span id="conn-text">Mất kết nối</span>
+        </div>
+        <button class="toggle-btn" onclick="toggleDrawer('right-drawer')">Chọn Cây</button>
+    </header>
+
+    <div class="app-container">
+        
+        <!-- LEFT DRAWER: MODE & MANUAL CONTROLS -->
+        <aside id="left-drawer" class="drawer">
+            <h3 class="card-title">Chế độ hoạt động</h3>
+            <button id="btn-mode-auto" class="btn btn-primary" onclick="setMode('AUTO')">TỰ ĐỘNG</button>
+            <button id="btn-mode-manual" class="btn btn-outline" onclick="setMode('MANUAL')">THỦ CÔNG</button>
+
+            <div id="manual-controls" style="display: none; margin-top: 20px;">
+                <h4 class="card-title" style="font-size: 0.85rem;">Điều khiển Thủ Công</h4>
+                <div style="margin: 10px 0;">
+                    <label style="font-size: 0.85rem;">Quạt: <b id="manual-fan-val">0%</b></label>
+                    <input type="range" id="fan-slider" min="0" max="100" value="0" style="width: 100%;" onchange="sendFanSpeed(this.value)" oninput="document.getElementById('manual-fan-val').innerText = this.value + '%'">
+                </div>
+                <div style="margin-top: 10px;">
+                    <label style="font-size: 0.85rem;">Bơm 1 (Zone 1):</label>
+                    <button class="btn btn-outline" onclick="sendPump(1, 'ON')">BẬT</button>
+                    <button class="btn btn-danger" onclick="sendPump(1, 'OFF')">TẮT</button>
+                </div>
+                <div style="margin-top: 10px;">
+                    <label style="font-size: 0.85rem;">Bơm 2 (Zone 2):</label>
+                    <button class="btn btn-outline" onclick="sendPump(2, 'ON')">BẬT</button>
+                    <button class="btn btn-danger" onclick="sendPump(2, 'OFF')">TẮT</button>
+                </div>
+            </div>
+        </aside>
+
+        <!-- CENTER CONTENT: MONITORING -->
+        <main class="center-content">
+            
+            <!-- DUAL PLANT SELECTION DISPLAY -->
+            <div class="card">
+                <div class="card-title">Loại cây được cài đặt cho 2 Zone</div>
+                <div class="dual-plant-grid">
+                    <div class="plant-card-zone" id="card-zone1" onclick="setActiveZone(1)">
+                        <div style="font-size: 0.8rem; font-weight: bold; color: var(--text-sub);">ZONE 1</div>
+                        <div class="plant-title" id="p1-name">Mặc định</div>
+                        <div class="target-sub">Ẩm: <b id="p1-soil">55-70%</b></div>
+                        <div class="target-sub">Quạt: <b id="p1-temp">>28°C</b></div>
+                    </div>
+                    <div class="plant-card-zone" id="card-zone2" onclick="setActiveZone(2)">
+                        <div style="font-size: 0.8rem; font-weight: bold; color: var(--text-sub);">ZONE 2</div>
+                        <div class="plant-title" id="p2-name">Mặc định</div>
+                        <div class="target-sub">Ẩm: <b id="p2-soil">55-70%</b></div>
+                        <div class="target-sub">Quạt: <b id="p2-temp">>28°C</b></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- SOIL ZONES -->
+            <div class="soil-zones-container">
+                <div class="card soil-box" id="soil1-box">
+                    <div class="card-title">ĐẤT 1 (Zone 1)</div>
+                    <div class="soil-val" id="soil1-val">-- %</div>
+                    <div class="soil-state" id="soil1-state">IDLE</div>
+                </div>
+
+                <div class="card soil-box" id="soil2-box">
+                    <div class="card-title">ĐẤT 2 (Zone 2)</div>
+                    <div class="soil-val" id="soil2-val">-- %</div>
+                    <div class="soil-state" id="soil2-state">IDLE</div>
+                </div>
+            </div>
+
+            <!-- ENVS -->
+            <div class="card">
+                <div class="card-title">Cảm biến môi trường & Bơm/Quạt</div>
+                <div class="env-grid">
+                    <div class="env-card"><div style="font-size:0.75rem; color:var(--text-sub);">Nhiệt độ</div><div class="env-val" id="env-temp">-- °C</div></div>
+                    <div class="env-card"><div style="font-size:0.75rem; color:var(--text-sub);">Độ ẩm KK</div><div class="env-val" id="env-rh">-- %</div></div>
+                    <div class="env-card"><div style="font-size:0.75rem; color:var(--text-sub);">Tốc độ Quạt</div><div class="env-val" id="env-fan">-- %</div></div>
+                    <div class="env-card"><div style="font-size:0.75rem; color:var(--text-sub);">Bơm 1</div><div class="env-val" id="env-pump1">OFF</div></div>
+                    <div class="env-card"><div style="font-size:0.75rem; color:var(--text-sub);">Bơm 2</div><div class="env-val" id="env-pump2">OFF</div></div>
+                </div>
+            </div>
+
+        </main>
+
+        <!-- RIGHT DRAWER: SELECT PLANT FOR ACTIVE ZONE -->
+        <aside id="right-drawer" class="drawer">
+            <h3 class="card-title">Chọn cây cho từng vùng</h3>
+            <div class="zone-tab-container">
+                <div class="zone-tab active" id="tab-z1" onclick="setActiveZone(1)">Chọn cho Zone 1</div>
+                <div class="zone-tab" id="tab-z2" onclick="setActiveZone(2)">Chọn cho Zone 2</div>
+            </div>
+            <input type="text" id="search-plant" class="search-box" placeholder="Tìm kiếm tên cây..." onkeyup="filterPlants()">
+            <div id="plant-list-container" style="max-height: 70vh; overflow-y: auto;"></div>
+        </aside>
+
+    </div>
+
+    <script>
+        let activeZoneToSet = 1;
+
+        function toggleDrawer(id) { document.getElementById(id).classList.toggle('open'); }
+
+        function setActiveZone(z) {
+            activeZoneToSet = z;
+            document.getElementById('tab-z1').className = z === 1 ? 'zone-tab active' : 'zone-tab';
+            document.getElementById('tab-z2').className = z === 2 ? 'zone-tab active' : 'zone-tab';
+            document.getElementById('card-zone1').className = z === 1 ? 'plant-card-zone active-zone' : 'plant-card-zone';
+            document.getElementById('card-zone2').className = z === 2 ? 'plant-card-zone active-zone' : 'plant-card-zone';
+        }
+
+        function setSoilBoxColor(boxId, val, isValid) {
+            const box = document.getElementById(boxId);
+            if (!isValid || val === null) { box.style.background = "#ffebee"; return; }
+            let alpha = (val / 100) * 0.4 + 0.05;
+            box.style.background = `rgba(76, 175, 80, ${alpha})`;
+        }
+
+        function updateUI(data) {
+            document.getElementById('conn-badge').className = "conn-status conn-online";
+            document.getElementById('conn-badge').innerHTML = '<span class="dot dot-online"></span> Đã kết nối';
+
+            // Zone 1
+            document.getElementById('p1-name').innerText = data.z1_plant || "Mặc định";
+            document.getElementById('p1-soil').innerText = `${data.z1_targets.soil_start}–${data.z1_targets.soil_stop}%`;
+            document.getElementById('p1-temp').innerText = `>${data.z1_targets.fan_temp_start}°C`;
+            document.getElementById('soil1-val').innerText = data.soil1_valid ? (data.soil1 + "%") : "LỖI";
+            document.getElementById('soil1-state').innerText = data.zone1_state;
+            setSoilBoxColor('soil1-box', data.soil1, data.soil1_valid);
+
+            // Zone 2
+            document.getElementById('p2-name').innerText = data.z2_plant || "Mặc định";
+            document.getElementById('p2-soil').innerText = `${data.z2_targets.soil_start}–${data.z2_targets.soil_stop}%`;
+            document.getElementById('p2-temp').innerText = `>${data.z2_targets.fan_temp_start}°C`;
+            document.getElementById('soil2-val').innerText = data.soil2_valid ? (data.soil2 + "%") : "LỖI";
+            document.getElementById('soil2-state').innerText = data.zone2_state;
+            setSoilBoxColor('soil2-box', data.soil2, data.soil2_valid);
+
+            // Env
+            document.getElementById('env-temp').innerText = data.temperature !== null ? (data.temperature + " °C") : "LỖI";
+            document.getElementById('env-rh').innerText = data.humidity !== null ? (data.humidity + " %") : "LỖI";
+            document.getElementById('env-fan').innerText = data.fan + " %";
+            document.getElementById('env-pump1').innerText = data.pump1 ? "BẬT" : "OFF";
+            document.getElementById('env-pump2').innerText = data.pump2 ? "BẬT" : "OFF";
+
+            if (data.mode === "AUTO") {
+                document.getElementById('btn-mode-auto').className = "btn btn-primary";
+                document.getElementById('btn-mode-manual').className = "btn btn-outline";
+                document.getElementById('manual-controls').style.display = "none";
+            } else {
+                document.getElementById('btn-mode-auto').className = "btn btn-outline";
+                document.getElementById('btn-mode-manual').className = "btn btn-primary";
+                document.getElementById('manual-controls').style.display = "block";
+            }
+        }
+
+        function fetchStatus() {
+            fetch('/api/status')
+                .then(res => res.json())
+                .then(data => updateUI(data))
+                .catch(err => {
+                    document.getElementById('conn-badge').className = "conn-status conn-offline";
+                    document.getElementById('conn-badge').innerHTML = '<span class="dot dot-offline"></span> Mất kết nối';
+                });
+        }
+
+        function setMode(mode) {
+            fetch('/api/mode', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({mode: mode}) }).then(() => fetchStatus());
+        }
+
+        function selectPlantForZone(plantName) {
+            fetch('/api/plant', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({zone: activeZoneToSet, plant: plantName})
+            }).then(() => fetchStatus());
+        }
+
+        function sendFanSpeed(val) {
+            fetch('/api/fan', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({speed: parseInt(val)}) });
+        }
+
+        function sendPump(pumpId, action) {
+            fetch('/api/pump', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({pump: pumpId, action: action}) }).then(() => fetchStatus());
+        }
+
+        const plantNames = [
+            "Default", "Xa lach", "Cai ngọt", "Cai thia", "Cai kale", "Rau bo xoi", "Rau muong", "Rau den", "Rau ngot", 
+            "Rau mong tai", "Tan o", "Cai cuc", "Hanh la", "Ca chua bi", "Ot chuong", "Dua luoi", "Dua leo", "Dua hau", 
+            "Ca tim", "Bau bi", "Kho qua", "Muop huong", "Dau co ve", "Dau Ha Lan", "Cu cai do", "Cu den", "Dau tay Da Lat", 
+            "Dau tay chịu nhiệt", "Nho ha den", "Nam linh chi", "Nam bao ngu", "Dong trung ha thao", "Dinh lang", "Hung tay", 
+            "Bac ha", "Huong thao", "Can tay", "Thi la", "Ngo ri", "Tia to", "Co ngọt", "Lan Ho Diep", "Lan Vu Nu", "Hoa Hong", 
+            "Hoa Cuc", "Hoa Dong Tien", "Hoa Cat Tuong", "Hoa Cam Chuong", "Hoa Ly", "Monstera", "Sen da"
+        ];
+
+        function renderPlantList() {
+            const container = document.getElementById('plant-list-container');
+            container.innerHTML = "";
+            plantNames.forEach(name => {
+                const div = document.createElement('div');
+                div.className = "plant-list-item";
+                div.innerText = name === "Default" ? "Mặc định" : name;
+                div.onclick = () => selectPlantForZone(name === "Default" ? "default" : name);
+                container.appendChild(div);
+            });
+        }
+
+        function filterPlants() {
+            const q = document.getElementById('search-plant').value.toLowerCase();
+            document.querySelectorAll('.plant-list-item').forEach(item => {
+                item.style.display = item.innerText.toLowerCase().includes(q) ? "block" : "none";
+            });
+        }
+
+        renderPlantList();
+        setActiveZone(1);
+        setInterval(fetchStatus, 2000);
+        fetchStatus();
+    </script>
+</body>
+</html>
+"""
+
+# ============================================================================
+# 8. NON-BLOCKING WEB SERVER & ENDPOINTS
+# ============================================================================
+def start_web_server():
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(('0.0.0.0', 80))
+    s.listen(5)
+    s.setblocking(False)
+    return s
+
+server_socket = start_web_server()
+
+def handle_web_client():
+    global system_mode, selected_plant_zone1, selected_plant_zone2, profile_zone1, profile_zone2, manual_fan_speed_pct
+    try:
+        cl, addr = server_socket.accept()
+    except OSError:
+        return
+
+    cl.settimeout(1.0)
+    try:
+        request = cl.recv(1024).decode('utf-8')
+        if not request:
+            cl.close()
+            return
+
+        lines = request.split('\r\n')
+        req_line = lines[0]
+        method, path, _ = req_line.split(' ')
+
+        if method == "GET" and path == "/":
+            cl.send('HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\r\n')
+            cl.sendall(HTML_WEB_PAGE.encode('utf-8'))
+
+        elif method == "GET" and path == "/api/status":
+            payload = {
+                "mode": system_mode,
+                "temperature": dht_temperature,
+                "humidity": dht_humidity,
+                "soil1": zone1.soil_pct,
+                "soil2": zone2.soil_pct,
+                "fan": fan_speed_pct,
+                "pump1": zone1.is_pump_on(),
+                "pump2": zone2.is_pump_on(),
+                "zone1_state": zone1.state,
+                "zone2_state": zone2.state,
+                "soil1_valid": zone1.soil_valid,
+                "soil2_valid": zone2.soil_valid,
+                "z1_plant": selected_plant_zone1,
+                "z2_plant": selected_plant_zone2,
+                "z1_targets": {
+                    "soil_start": profile_zone1["soil_start"],
+                    "soil_stop": profile_zone1["soil_stop"],
+                    "fan_temp_start": profile_zone1["fan_temp_start"]
+                },
+                "z2_targets": {
+                    "soil_start": profile_zone2["soil_start"],
+                    "soil_stop": profile_zone2["soil_stop"],
+                    "fan_temp_start": profile_zone2["fan_temp_start"]
+                }
+            }
+            cl.send('HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n')
+            cl.send(json.dumps(payload))
+
+        elif method == "POST" and path == "/api/mode":
+            body = request.split('\r\n\r\n')[1]
+            data = json.loads(body)
+            system_mode = data.get("mode", "AUTO")
+            zone1.set_pump(False)
+            zone2.set_pump(False)
+            cl.send('HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{"status":"OK"}')
+
+        elif method == "POST" and path == "/api/plant":
+            body = request.split('\r\n\r\n')[1]
+            data = json.loads(body)
+            z_num = data.get("zone", 1)
+            p_name = data.get("plant", "default")
+            
+            if z_num == 1:
+                selected_plant_zone1 = p_name
+                profile_zone1 = get_plant_profile(p_name)
+                print(f"[API] Zone 1 Plant updated to: {selected_plant_zone1}")
+            else:
+                selected_plant_zone2 = p_name
+                profile_zone2 = get_plant_profile(p_name)
+                print(f"[API] Zone 2 Plant updated to: {selected_plant_zone2}")
+                
+            cl.send('HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{"status":"OK"}')
+
+        elif method == "POST" and path == "/api/fan":
+            body = request.split('\r\n\r\n')[1]
+            data = json.loads(body)
+            manual_fan_speed_pct = data.get("speed", 0)
+            cl.send('HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{"status":"OK"}')
+
+        elif method == "POST" and path == "/api/pump":
+            body = request.split('\r\n\r\n')[1]
+            data = json.loads(body)
+            pump_num = data.get("pump")
+            action = data.get("action")
+            
+            if system_mode == "MANUAL":
+                now = time.ticks_ms()
+                if pump_num == 1:
+                    zone1.set_pump(action == "ON")
+                    zone1.manual_start_time = now
+                elif pump_num == 2:
+                    zone2.set_pump(action == "ON")
+                    zone2.manual_start_time = now
+            cl.send('HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{"status":"OK"}')
+
+        else:
+            cl.send('HTTP/1.1 404 Not Found\r\n\r\n')
+
+    except Exception:
+        pass
+    finally:
+        cl.close()
+
+# ============================================================================
+# 9. MAIN LOOP (VÒNG LẶP CHÍNH)
+# ============================================================================
+print("[INFO] ESP32 Smart Greenhouse Dual-Zone Running...")
+gc.collect()
+
+while True:
+    try:
+        update_dht_sensor()
+
+        if system_mode == "AUTO":
+            zone1.update_auto(profile_zone1, zone2.is_pump_on())
+            zone2.update_auto(profile_zone2, zone1.is_pump_on())
+        else:
+            zone1.read_sensor()
+            zone2.read_sensor()
+
+        update_air_control()
+        enforce_pump_safety()
+        handle_web_client()
+        
+        gc.collect()
+        time.sleep_ms(20)
+
+    except Exception as err:
+        print("[CRITICAL ERROR in Main Loop]:", err)
+        time.sleep_ms(100)
+
